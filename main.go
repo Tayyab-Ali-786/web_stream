@@ -62,6 +62,7 @@ import (
 	"flag"
 	"log"
 	"net/http"
+	_ "net/http/pprof" // register /debug/pprof handlers
 	"os"
 	"os/signal"
 	"syscall"
@@ -73,7 +74,6 @@ import (
 
 func main() {
 	var (
-		udpAddr    = flag.String("udp", ":5004", "UDP ingestion address (simulator sends here)")
 		httpAddr   = flag.String("http", ":8080", "HTTP signaling server address")
 		bufDepth   = flag.Int("buf", 256, "Interceptor output channel buffer depth")
 		windowMs   = flag.Int("window", 60, "Jitter reorder window in milliseconds (Layer 1)")
@@ -137,14 +137,15 @@ func main() {
 		*targetFPS, tsIncrement)
 
 	// ─── 5. Build the WebRTC PeerManager ─────────────────────────────────────
-	// Now reads from webrtcCh — paced AND timestamp-normalised.
-	pm, err := webrtcpeer.NewPeerManager(webrtcCh)
+	// Bypassing JitterBuffer and PTS Normalizer because GStreamer handles
+	// pacing natively and outputs multiple properly sequenced packets per frame.
+	pm, err := webrtcpeer.NewPeerManager(rawCh)
 	if err != nil {
 		logger.Fatalf("create peer manager: %v", err)
 	}
 
-	// ─── 6. Build the UDP Ingester ────────────────────────────────────────────
-	ingester := pipeline.NewUDPIngester(*udpAddr, interceptor)
+	// ─── 6. Build the Camera Listener ─────────────────────────────────────────
+	ingester := pipeline.NewCameraListener(interceptor)
 
 	// ─── 7. Graceful-shutdown plumbing ────────────────────────────────────────
 	stop := make(chan struct{})
@@ -156,17 +157,25 @@ func main() {
 		close(stop)
 	}()
 
-	// ─── 8. Start the jitter buffer (Layer 1 + 2) ─────────────────────────────
-	go jb.Run(stop)
+	// ─── 8. Start the WebRTC forwarding loop ─────────────────────────────────
+	// (JitterBuffer and PTSNormalizer disabled for live camera ingestion)
+	// go jb.Run(stop)
+	// go pn.Run(stop)
 
-	// ─── 9. Start the PTS normalizer ──────────────────────────────────────────
-	go pn.Run(stop)
+	// ─── 9. pprof debug server (Test 2 — Resource Leak) ──────────────────────
+	go func() {
+		profAddr := ":6060"
+		logger.Printf("pprof server on http://localhost%s/debug/pprof", profAddr)
+		if err := http.ListenAndServe(profAddr, nil); err != nil {
+			logger.Printf("pprof server error: %v", err)
+		}
+	}()
 
 	// ─── 10. Start the WebRTC forwarding loop ─────────────────────────────────
 	go pm.Run(stop)
 
-	// ─── 11. Start the HTTP signaling server ──────────────────────────────────
 	mux := http.NewServeMux()
+	mux.HandleFunc("/api/auth/login", corsMiddleware(handleLogin))
 	mux.HandleFunc("/api/offer", corsMiddleware(pm.HandleOffer))
 	// /api/stats includes interceptor, jitter buffer AND PTS normalizer metrics
 	mux.HandleFunc("/api/stats", corsMiddleware(makeStatsHandler(pm, interceptor, jb, pn)))
@@ -194,11 +203,22 @@ func main() {
 		srv.Shutdown(ctx) //nolint:errcheck
 	}()
 
-	// ─── 12. Start UDP ingestion (blocks until stop) ──────────────────────────
-	// Every datagram: interceptor.Intercept() → jitter buffer → PTSNormalizer → WebRTC.
-	if err := ingester.Listen(stop); err != nil {
-		logger.Printf("ingester stopped: %v", err)
+	// ─── 12. Camera reconnect loop (Test 4 — Failover) ───────────────────────
+	// If GStreamer exits (camera disconnected), we wait 3 s and restart.
+	// Closing stop exits the loop cleanly.
+	for {
+		err := ingester.Listen(stop)
+		select {
+		case <-stop:
+			logger.Printf("ingester stopped: %v", err)
+			goto shutdown
+		default:
+			logger.Printf("[FAILOVER] camera source disconnected (%v) — reconnecting in 3s", err)
+			time.Sleep(3 * time.Second)
+			ingester = pipeline.NewCameraListener(interceptor)
+		}
 	}
+shutdown:
 
 	// Print final stats
 	rx, dropped, fwd := interceptor.Stats()
@@ -224,6 +244,31 @@ func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
 		}
 		next.ServeHTTP(w, r)
 	}
+}
+
+// authMiddleware enforces the mock Bearer token for protected routes
+func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		authHeader := r.Header.Get("Authorization")
+		if authHeader == "" || authHeader != "Bearer mock-prototype-token-123" {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	}
+}
+
+// handleLogin provides a mock authentication flow
+func handleLogin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{ //nolint:errcheck
+		"token": "mock-prototype-token-123",
+	})
 }
 
 // makeStatsHandler returns a unified /api/stats handler combining
