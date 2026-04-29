@@ -9,3 +9,11 @@
 [web_stream]  2026/04/22 02:38:39.789861 pprof server on http://localhost:6060/debug/pprof
 [camera]      2026/04/22 02:38:39.790321 started gstreamer (PID 45059)
 [interceptor] 2026/04/22 02:38:39.908178 PKT stream=camera-stream cam=local-webcam seq=0 ts=1024389299 frame#=0 size=2 lat=0.0ms  (rx=1 fwd=0)
+[web_stream]  2026/04/22 17:42:07.973008 ■ shutdown signal — stopping all components
+[webrtc]      2026/04/22 17:42:07.973476 stop — closing all peer connections
+[camera]      2026/04/22 17:42:07.973491 stop signal received — killing gstreamer
+[web_stream]  2026/04/22 17:42:07.973909 ingester stopped: <nil>
+[web_stream]  2026/04/22 17:42:07.973916 interceptor  — received=14 dropped=0 forwarded=14
+[web_stream]  2026/04/22 17:42:07.973923 jitter buf   — in=0 released=0 evicted=0 late=0
+[web_stream]  2026/04/22 17:42:07.973927 PTS norm     — normalized=0 tsIncrement=3000 finalTS=0
+[web_stream]  2026/04/22 17:42:07.973930 ■ web_stream exited cleanly

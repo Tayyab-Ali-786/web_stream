@@ -11,6 +11,7 @@
 package webrtc
 
 import (
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -147,7 +148,7 @@ func (pm *PeerManager) HandleOffer(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Register connection state handler
-	peerID := r.RemoteAddr
+	peerID := randomPeerID()
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
 		pm.logger.Printf("peer %s state → %s", peerID, state)
 		if state == webrtc.PeerConnectionStateClosed ||
@@ -156,6 +157,10 @@ func (pm *PeerManager) HandleOffer(w http.ResponseWriter, r *http.Request) {
 			pm.mu.Lock()
 			delete(pm.peers, peerID)
 			pm.mu.Unlock()
+			// Explicitly close to ensure Pion internal goroutines are reaped
+			if state != webrtc.PeerConnectionStateClosed {
+				_ = pc.Close()
+			}
 		}
 	})
 
@@ -213,4 +218,13 @@ func (pm *PeerManager) HandleStats(w http.ResponseWriter, _ *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{ //nolint:errcheck
 		"peers": pm.PeerCount(),
 	})
+}
+
+// randomPeerID generates a cryptographically-random peer identifier
+// to avoid map-key collisions when multiple browser tabs connect from
+// the same host (which share a RemoteAddr).
+func randomPeerID() string {
+	b := make([]byte, 8)
+	rand.Read(b)
+	return fmt.Sprintf("peer-%x", b)
 }

@@ -1,10 +1,11 @@
 // web_stream — Huvio AI packet pipeline server
 //
 // This server:
-//  1. Binds a UDP socket to receive video packets from the simulator
-//  2. Passes every datagram through the PacketInterceptor (hook point)
-//  3. Reorders and paces packets through the Dual-Layer JitterBuffer
-//  4. Forwards smoothly-timed packets to the WebRTC peer manager
+//  1. Captures video from a local webcam via GStreamer (CameraListener)
+//  2. Passes every RTP datagram through the PacketInterceptor (hook point)
+//  3. Groups RTP packets into H.264 Access Units and paces them via the
+//     Frame-Aware Metronome (replaces old JitterBuffer + PTSNormalizer)
+//  4. Forwards complete, timestamp-normalised frames to the WebRTC PeerManager
 //  5. Serves an HTTP signaling endpoint for browser viewers
 //
 // Usage:
@@ -13,47 +14,36 @@
 //
 // Flags:
 //
-//	-udp      UDP ingestion address (default :5004)
 //	-http     HTTP signaling address (default :8080)
 //	-buf      Interceptor output channel depth (default 256)
-//	-window   Jitter reorder window in ms (default 60)
 //	-fps      Target output frame rate (default 30)
 //
-// Pipeline diagram (STEP 3 — reliable PTS):
+// Pipeline diagram (Frame-Aware Metronome architecture):
 //
-//	simulator ──UDP──► UDPIngester.Listen()
-//	                         │
-//	                         ▼
-//	              PacketInterceptor.Intercept()   ← hook point
-//	              (latency-alert hook only;
-//	               ts-rewrite REMOVED — see PTSNormalizer)
-//	                         │
-//	                    rawCh (buffered)
-//	                         │
-//	                         ▼
-//	              JitterBuffer.Run()              ← Step 2
-//	              ┌──────────────────────────────┐
-//	              │  Layer 1: min-heap reorder   │
-//	              │  Layer 2: ticker drain       │
-//	              └──────────────────────────────┘
-//	                         │
-//	                    smoothCh (buffered)
-//	                         │
-//	                         ▼
-//	              PTSNormalizer.Run()             ← NEW (Step 3)
-//	              ┌──────────────────────────────┐
-//	              │  NewTS = PrevTS + (90k/FPS)  │
-//	              │  RFC 3550 random seed        │
-//	              └──────────────────────────────┘
-//	                         │
-//	                    webrtcCh (buffered)
-//	                         │
-//	                         ▼
-//	              PeerManager.Run()
-//	                         │
-//	               Pion VideoTrack.Write()
-//	                         │
-//	                  browser WebRTC peer
+//	GStreamer (v4l2src) ──UDP──► CameraListener.Listen()
+//	                                    │
+//	                                    ▼
+//	                         PacketInterceptor.Intercept()   ← hook point
+//	                         (latency-alert hook)
+//	                                    │
+//	                               rawCh (buffered)
+//	                                    │
+//	                                    ▼
+//	                         FrameMetronome.Run()
+//	                         ┌──────────────────────────────┐
+//	                         │  Accumulate RTP → full AU    │
+//	                         │  Linear PTS normalisation    │
+//	                         │  33ms tick → burst all pkts  │
+//	                         └──────────────────────────────┘
+//	                                    │
+//	                               webrtcCh (buffered)
+//	                                    │
+//	                                    ▼
+//	                         PeerManager.Run()
+//	                                    │
+//	                          Pion VideoTrack.Write()
+//	                                    │
+//	                             browser WebRTC peer
 package main
 
 import (
@@ -76,13 +66,22 @@ func main() {
 	var (
 		httpAddr   = flag.String("http", ":8080", "HTTP signaling server address")
 		bufDepth   = flag.Int("buf", 256, "Interceptor output channel buffer depth")
-		windowMs   = flag.Int("window", 60, "Jitter reorder window in milliseconds (Layer 1)")
 		targetFPS  = flag.Float64("fps", 30.0, "Target output frame rate for the metronome (Layer 2)")
 	)
 	flag.Parse()
 
 	logger := log.New(os.Stdout, "[web_stream]  ", log.LstdFlags|log.Lmicroseconds)
 	logger.Println("▶ Huvio AI web_stream starting")
+
+	// Graceful-shutdown plumbing
+	stop := make(chan struct{})
+	go func() {
+		quit := make(chan os.Signal, 1)
+		signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
+		<-quit
+		logger.Println("■ shutdown signal — stopping all components")
+		close(stop)
+	}()
 
 	// ─── 1. Create the interceptor → jitter buffer channel ──────────────────
 	// Packets that survive all interceptor hooks land here.
@@ -103,43 +102,23 @@ func main() {
 	// (in the interceptor) was wrong because the browser sees the timestamp
 	// relative to when the packet is transmitted, not when it arrived.
 
-	// ─── 3. Build the Dual-Layer Jitter Buffer ────────────────────────────────
-	// smoothCh carries metronome-paced but still un-normalised packets.
-	smoothCh := make(chan *pipeline.IngressPacket, 64)
-
-	tickInterval := time.Duration(float64(time.Second) / *targetFPS)
-	jb := pipeline.NewJitterBuffer(pipeline.JitterConfig{
-		In:             rawCh,
-		Out:            smoothCh,
-		WindowDuration: time.Duration(*windowMs) * time.Millisecond,
-		TickInterval:   tickInterval,
-	})
-	logger.Printf("jitter buffer  window=%dms  tick=%v (~%.1f FPS)",
-		*windowMs, tickInterval, *targetFPS)
-
-	// ─── 4. Build the PTS Normalizer (Step 3) ─────────────────────────────────
-	// webrtcCh carries packets with perfectly-linear RTP timestamps.
-	// The PTSNormalizer runs AFTER the metronome so timestamps are stamped at
-	// the exact moment of transmission — not at arrival.
-	//
-	// Math:  NewTS = PreviousTS + (90000 / TargetFPS)
-	// 30fps: each packet increments timestamp by exactly 3000 units.
-	// First packet: cryptographically-random seed (RFC 3550 §5.1).
-	webrtcCh := make(chan *pipeline.IngressPacket, 64)
-	pn := pipeline.NewPTSNormalizer(pipeline.PTSConfig{
-		In:        smoothCh,
+	// ─── 3. Build the Frame-Aware Metronome ──────────────────────────────────
+	// webrtcCh carries complete frames (Access Units) to the PeerManager.
+	// This replaces both the old JitterBuffer and PTSNormalizer.
+	webrtcCh := make(chan *pipeline.IngressPacket, *bufDepth)
+	fm := pipeline.NewFrameMetronome(pipeline.FrameMetronomeConfig{
+		In:        rawCh,
 		Out:       webrtcCh,
-		ClockRate: 90_000,
 		TargetFPS: *targetFPS,
+		ClockRate: 90000,
 	})
-	tsIncrement := uint32(90_000 / *targetFPS)
-	logger.Printf("PTS normalizer  clockRate=90000  fps=%.1f  tsIncrement=%d",
-		*targetFPS, tsIncrement)
+
+	// ─── 4. Start the Metronome loop ─────────────────────────────────────────
+	go fm.Run(stop)
 
 	// ─── 5. Build the WebRTC PeerManager ─────────────────────────────────────
-	// Bypassing JitterBuffer and PTS Normalizer because GStreamer handles
-	// pacing natively and outputs multiple properly sequenced packets per frame.
-	pm, err := webrtcpeer.NewPeerManager(rawCh)
+	// PeerManager now consumes from the frame-aware metronome output.
+	pm, err := webrtcpeer.NewPeerManager(webrtcCh)
 	if err != nil {
 		logger.Fatalf("create peer manager: %v", err)
 	}
@@ -147,20 +126,7 @@ func main() {
 	// ─── 6. Build the Camera Listener ─────────────────────────────────────────
 	ingester := pipeline.NewCameraListener(interceptor)
 
-	// ─── 7. Graceful-shutdown plumbing ────────────────────────────────────────
-	stop := make(chan struct{})
-	go func() {
-		quit := make(chan os.Signal, 1)
-		signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
-		<-quit
-		logger.Println("■ shutdown signal — stopping all components")
-		close(stop)
-	}()
 
-	// ─── 8. Start the WebRTC forwarding loop ─────────────────────────────────
-	// (JitterBuffer and PTSNormalizer disabled for live camera ingestion)
-	// go jb.Run(stop)
-	// go pn.Run(stop)
 
 	// ─── 9. pprof debug server (Test 2 — Resource Leak) ──────────────────────
 	go func() {
@@ -176,9 +142,9 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/auth/login", corsMiddleware(handleLogin))
-	mux.HandleFunc("/api/offer", corsMiddleware(pm.HandleOffer))
-	// /api/stats includes interceptor, jitter buffer AND PTS normalizer metrics
-	mux.HandleFunc("/api/stats", corsMiddleware(makeStatsHandler(pm, interceptor, jb, pn)))
+	mux.HandleFunc("/api/offer", corsMiddleware(authMiddleware(pm.HandleOffer)))
+	// /api/stats includes interceptor, frame metronome AND peer count metrics
+	mux.HandleFunc("/api/stats", corsMiddleware(makeStatsHandler(pm, interceptor, fm)))
 	mux.HandleFunc("/", serveViewer)
 
 	srv := &http.Server{
@@ -222,13 +188,10 @@ shutdown:
 
 	// Print final stats
 	rx, dropped, fwd := interceptor.Stats()
-	js := jb.Stats()
-	ps := pn.Stats()
+	fs := fm.Stats()
 	logger.Printf("interceptor  — received=%d dropped=%d forwarded=%d", rx, dropped, fwd)
-	logger.Printf("jitter buf   — in=%d released=%d evicted=%d late=%d",
-		js.TotalIn, js.TotalRelease, js.TotalEvicted, js.TotalLate)
-	logger.Printf("PTS norm     — normalized=%d tsIncrement=%d finalTS=%d",
-		ps.TotalNormalized, ps.TSIncrement, ps.NextTS)
+	logger.Printf("frame metro  — frames_in=%d burst=%d pkts_out=%d force_flush=%d ts_fix=%d",
+		fs.FramesAccumulated, fs.FramesBurst, fs.PacketsOut, fs.ForceFlushes, fs.TimestampFixes)
 	logger.Println("■ web_stream exited cleanly")
 }
 
@@ -272,17 +235,15 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 }
 
 // makeStatsHandler returns a unified /api/stats handler combining
-// interceptor counters, jitter buffer health, PTS normalizer state, and peer count.
+// interceptor counters, frame metronome health, and peer count.
 func makeStatsHandler(
 	pm interface{ PeerCount() int },
 	interceptor interface{ Stats() (uint64, uint64, uint64) },
-	jb interface{ Stats() pipeline.JitterStats },
-	pn interface{ Stats() pipeline.PTSStats },
+	fm interface{ Stats() pipeline.FrameMetronomeStats },
 ) http.HandlerFunc {
 	return func(w http.ResponseWriter, _ *http.Request) {
 		rx, dropped, fwd := interceptor.Stats()
-		js := jb.Stats()
-		ps := pn.Stats()
+		fs := fm.Stats()
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{ //nolint:errcheck
 			"interceptor": map[string]uint64{
@@ -290,9 +251,8 @@ func makeStatsHandler(
 				"dropped":   dropped,
 				"forwarded": fwd,
 			},
-			"jitter_buffer": js,
-			"pts_normalizer": ps,
-			"peers":         pm.PeerCount(),
+			"frame_metronome": fs,
+			"peers":           pm.PeerCount(),
 		})
 	}
 }
