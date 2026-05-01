@@ -32,28 +32,45 @@ import (
 // It receives IngressPackets from the interceptor's output channel and writes
 // their RTP payload to the track for all connected peers.
 type PeerManager struct {
-	mu      sync.RWMutex
-	peers   map[string]*webrtc.PeerConnection
-	track   *webrtc.TrackLocalStaticRTP
-	api     *webrtc.API
-	in      <-chan *pipeline.IngressPacket
-	logger  *log.Logger
+	mu          sync.RWMutex
+	peers       map[string]*webrtc.PeerConnection
+	track       *webrtc.TrackLocalStaticRTP
+	api         *webrtc.API
+	in          <-chan *pipeline.IngressPacket
+	logger      *log.Logger
 }
 
 // NewPeerManager creates a PeerManager that reads from in.
 // Call Run() in a goroutine to start forwarding packets.
 func NewPeerManager(in <-chan *pipeline.IngressPacket) (*PeerManager, error) {
-	// Build a Pion API with default codecs
+	// Register ONLY H.264 Baseline at PT=96.
+	// GStreamer's rtph264pay is configured with pt=96 — the negotiated payload
+	// type MUST match or the browser silently discards every RTP packet.
 	m := &webrtc.MediaEngine{}
-	if err := m.RegisterDefaultCodecs(); err != nil {
-		return nil, fmt.Errorf("register codecs: %w", err)
+	if err := m.RegisterCodec(webrtc.RTPCodecParameters{
+		RTPCodecCapability: webrtc.RTPCodecCapability{
+			MimeType:    webrtc.MimeTypeH264,
+			ClockRate:   90000,
+			Channels:    0,
+			// Constrained Baseline, Level 3.1 — matches GStreamer profile=baseline
+			SDPFmtpLine: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f",
+		},
+		PayloadType: 96,
+	}, webrtc.RTPCodecTypeVideo); err != nil {
+		return nil, fmt.Errorf("register H264 codec: %w", err)
 	}
 
 	api := webrtc.NewAPI(webrtc.WithMediaEngine(m))
 
-	// Shared H.264 video track — all peers subscribe to this
+	// Shared H.264 video track — all peers subscribe to this.
+	// We specify the EXACT capability (PT=96, Baseline) to match the codec
+	// registration above, ensuring the SDP and RTP packet metadata align.
 	track, err := webrtc.NewTrackLocalStaticRTP(
-		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeH264},
+		webrtc.RTPCodecCapability{
+			MimeType:    webrtc.MimeTypeH264,
+			ClockRate:   90000,
+			SDPFmtpLine: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f",
+		},
 		"video", "huvio-stream",
 	)
 	if err != nil {
@@ -95,17 +112,13 @@ func (pm *PeerManager) Run(stop <-chan struct{}) {
 	}
 }
 
-// writePacket marshals the intercepted RTP packet and writes it to the track.
+// writePacket writes the RTP packet to the shared Pion track.
+// Pion's TrackLocalStaticRTP.WriteRTP() handles SSRC and PayloadType
+// translation for each individual peer connection internally.
 func (pm *PeerManager) writePacket(pkt *pipeline.IngressPacket) {
-	raw, err := pkt.RTP.Marshal()
-	if err != nil {
-		pm.logger.Printf("ERROR marshal RTP seq=%d: %v", pkt.Meta.SequenceNum, err)
-		return
-	}
-	// WriteRTP sends the raw RTP bytes to all peer connections subscribed to the track.
-	if _, err := pm.track.Write(raw); err != nil {
+	if err := pm.track.WriteRTP(pkt.RTP); err != nil {
 		// Ignore "use of closed network connection" — happens during teardown
-		pm.logger.Printf("WARN track.Write seq=%d: %v", pkt.Meta.SequenceNum, err)
+		pm.logger.Printf("WARN track.WriteRTP seq=%d: %v", pkt.Meta.SequenceNum, err)
 	}
 }
 
@@ -190,7 +203,6 @@ func (pm *PeerManager) HandleOffer(w http.ResponseWriter, r *http.Request) {
 	}
 	<-gatherDone
 
-	// Store peer
 	pm.mu.Lock()
 	pm.peers[peerID] = pc
 	pm.mu.Unlock()

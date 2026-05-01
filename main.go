@@ -315,9 +315,16 @@ async function connect() {
   const offer = await pc.createOffer();
   await pc.setLocalDescription(offer);
 
+  const authRes = await fetch('/api/auth/login', { method: 'POST' });
+  const authData = await authRes.json();
+  const token = authData.token;
+
   const res = await fetch('/api/offer', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 
+      'Content-Type': 'application/json',
+      'Authorization': 'Bearer ' + token
+    },
     body: JSON.stringify({ sdp: offer.sdp, type: offer.type })
   });
   const answer = await res.json();
