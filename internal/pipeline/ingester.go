@@ -125,17 +125,21 @@ func (c *CameraListener) Listen(stop <-chan struct{}) error {
 	// Added 'intra-refresh=true' to eliminate large I-frame bitrate spikes.
 	// Added 'byte-stream=true' and 'key-int-max=30' for better compatibility.
 	cmd := exec.Command("gst-launch-1.0",
-		"-v",
 		"v4l2src", "device=/dev/video58", "!",
 		"video/x-raw,framerate=30/1", "!",
+		"queue", "max-size-buffers=2", "leaky=downstream", "!",
 		"videoconvert", "!", "videoscale", "!",
 		"video/x-raw,width=640,height=480", "!",
-		"videoconvert", "!",
+		"queue", "max-size-buffers=2", "leaky=downstream", "!",
 		"x264enc", "speed-preset=ultrafast", "tune=zerolatency", "key-int-max=30", "bitrate=2000", "!",
 		"video/x-h264,profile=baseline", "!",
 		"rtph264pay", "pt=96", "mtu=1200", "config-interval=1", "!",
-		"udpsink", "host=127.0.0.1", fmt.Sprintf("port=%d", localPort),
+		"udpsink", "host=127.0.0.1", fmt.Sprintf("port=%d", localPort), "sync=false", "async=false",
 	)
+	// CRITICAL: Discard stdout — GStreamer's verbose output fills Go's pipe
+	// buffer (64KB), and once full the pipeline blocks forever. This was the
+	// root cause of the "14 packets then stall" bug.
+	cmd.Stdout = nil
 	cmd.Stderr = os.Stderr
 
 	if err := cmd.Start(); err != nil {

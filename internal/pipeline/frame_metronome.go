@@ -246,24 +246,14 @@ func (fm *FrameMetronome) pushFrame(frame []*IngressPacket) {
 		return
 	}
 
-	// ── Linear Timestamp Normalization ─────────────────────────────────────
-	if !fm.initialized {
-		fm.nextTS = fm.cryptoRandUint32()
-		fm.initialized = true
-		fm.logger.Printf("timestamp seed (RFC 3550 random): %d", fm.nextTS)
-	}
-
-	normalizedTS := fm.nextTS
-	for _, pkt := range frame {
-		if pkt.RTP.Header.Timestamp != normalizedTS {
-			// Track how many packets had their timestamp corrected.
-			atomic.AddUint64(&fm.totalTimestampFix, 1)
-		}
-		pkt.RTP.Header.Timestamp = normalizedTS
-	}
-	// Advance the clock for the next frame regardless of whether this frame
-	// was Marker-terminated or force-flushed. This keeps the sequence linear.
-	fm.nextTS += fm.tsIncrement
+	// Pass through GStreamer's original RTP timestamps unchanged.
+	// GStreamer's rtph264pay already produces correct monotonic 90kHz
+	// timestamps. Overwriting them with a random seed breaks the browser's
+	// H.264 decoder after the first keyframe because P-frames lose their
+	// timing reference.
+	//
+	// The timestamp_fixes counter is no longer meaningful — set to 0.
+	_ = fm.tsIncrement
 
 	out := make([]*IngressPacket, len(frame))
 	copy(out, frame)
@@ -384,7 +374,7 @@ func (fm *FrameMetronome) Stats() FrameMetronomeStats {
 		FramesBurst:       atomic.LoadUint64(&fm.totalFramesBurst),
 		PacketsOut:        atomic.LoadUint64(&fm.totalPacketsOut),
 		ForceFlushes:      atomic.LoadUint64(&fm.totalForceFlushes),
-		TimestampFixes:    atomic.LoadUint64(&fm.totalTimestampFix),
+		TimestampFixes:    0, // timestamps are now passed through unchanged
 		ReadyQueueDepth:   len(fm.readyCh),
 	}
 }
